@@ -1,0 +1,121 @@
+#!/usr/bin/env ruby
+
+require 'ostruct'
+require 'resolv'
+require 'shellwords'
+require 'optparse'
+require 'socket'
+
+CLIENT_IP_PREFIXS = ["10.161","10.163", "10.133", "72.52"]
+
+DEFAULT_DESITINATIONS = ['0/1','default']
+
+def local_ip_prefix
+  Socket.ip_address_list.detect{|intf| intf.ipv4_private?}.ip_address.split('.')[0..1].join('.')
+end
+
+def netstat
+  route_table = `netstat -nr -f inet`
+  route_table.split("\n").slice(4..-1).map do |line|
+    route = Shellwords.split(line)
+    OpenStruct.new({destination: route[0], gateway: route[1]})
+  end
+end
+
+def resolve_address(host)
+  IPSocket::getaddress(host)
+end
+
+def dns_resovers
+  Resolv::DNS::Config.default_config_hash[:nameserver].select { |ns| in_client_network?(ns) }
+end
+
+def restore
+  puts "Restoring route table to default settings...."
+  for i in (1..3) do
+    `netstat -n flush`
+  end
+
+  `ifconfig en0  down`
+  `ifconfig en0  up`
+end
+
+def delete_route(destination, gateway)
+  puts "Deleting route #{destination} : #{gateway}"
+  `route delete #{destination} #{gateway}`
+end
+
+def add_host_route(destination, gateway)
+  puts "Add route #{destination} : #{gateway}"
+  `route add -host #{destination} #{gateway}`
+end
+
+def add_net_route(destination, gateway)
+  puts "Add route #{destination} : #{gateway}"
+  `route add -net #{destination} #{gateway}`
+end
+
+def in_client_network?(ip)
+  CLIENT_IP_PREFIXS.any? { |prefix| ip.start_with?(prefix)}
+end
+
+def in_office_network?(ip)
+  OFFICE_IP_PREFIXS.any? { |prefix| ip.start_with?(prefix)}
+end
+
+
+def fix
+  f5_routes = netstat.select {|route| in_client_network?(route.destination) || in_client_network?(route.gateway) }
+
+  if f5_routes.empty?
+    puts "f5 route settings not found, are you connecting to F5 VPN?"
+    return 
+  end
+
+  puts "start fixing..."
+  routes = netstat.select { |route| DEFAULT_DESITINATIONS.include?(route.destination) && in_client_network?(route.gateway) }
+  if routes.count == 0
+    puts "network routes already fixed"
+    exit(0)
+  end
+  f5_gateway = routes.first.gateway
+  office_gateway = netstat.select { |route| DEFAULT_DESITINATIONS.include?(route.destination) && route.gateway.start_with?(local_ip_prefix()) }.first.gateway
+
+  puts "Delete f5 routes..."
+  f5_routes.each do |route|
+    delete_route(route.destination, route.gateway)
+  end
+
+  CLIENT_IP_PREFIXS.each do |prefix|
+    add_net_route(prefix, f5_gateway)
+  end
+
+  dns_resovers.each  do |ns|
+    add_host_route(ns, f5_gateway)
+  end
+
+  puts "Seting office network as default route..."
+  add_host_route('0/1', office_gateway)
+
+end
+
+options = {}
+OptionParser.new do  |opts|
+  opts.banner = "Usage: fix [options]"
+
+  opts.on('-r','--restore','Restore route table to default settings') do 
+    options[:restore] = true
+  end
+  
+  opts.on('-f', '--fix', 'Patch route table to make f5 vpn work with office network ') do 
+    options[:fix] = true
+  end
+
+  opts.on('-h', '--help', 'Show this help') do 
+    puts opts
+    exit
+  end
+end.parse!
+
+fix if options[:fix]
+restore if options[:restore]
